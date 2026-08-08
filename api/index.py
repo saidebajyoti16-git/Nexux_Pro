@@ -343,14 +343,14 @@ HTML_PAGE = """
                 .then(data => {
                     hideLoader();
                     if(data.error || !data.url) {
-                        alert("Failed to extract media URL.");
+                        alert("Error: " + (data.error || "Failed to extract media URL."));
                         return;
                     }
                     const videoNode = document.getElementById('mainVideo');
                     videoNode.src = data.url;
                     videoNode.play().catch(e => console.log("Autoplay blocked:", e));
                 })
-                .catch(() => {
+                .catch(err => {
                     hideLoader();
                     alert("Error fetching stream context.");
                 });
@@ -533,13 +533,17 @@ HTML_PAGE = """
 </html>
 """
 
-def get_clean_youtube_url(query):
+def extract_video_id(query):
     query = query.strip()
     match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', query)
-    if match: return f"https://www.youtube.com/watch?v={match.group(1)}"
+    if match: return match.group(1)
     if len(query) == 11 and re.match(r'^[0-9A-Za-z_-]{11}$', query):
-        return f"https://www.youtube.com/watch?v={query}"
+        return query
     return query
+
+def get_clean_youtube_url(query):
+    v_id = extract_video_id(query)
+    return f"https://www.youtube.com/watch?v={v_id}"
 
 @app.route('/')
 def home():
@@ -598,17 +602,49 @@ def stream_video():
     if not query: return jsonify({'error': 'Missing query'}), 400
     
     target_url = get_clean_youtube_url(query)
+    video_id = extract_video_id(query)
+    
+    # Method 1: Try yt-dlp using Android & iOS client signatures to bypass YouTube datacenter blocks
     ydl_opts = {
-        'format': 'best[ext=mp4][height<=720]/best[ext=mp4]/best',
+        'format': 'best',
         'quiet': True,
         'noplaylist': True,
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'ios', 'web']
+            }
+        }
     }
     
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(target_url, download=False)
             video_url = info.get('url')
-            return jsonify({'url': video_url})
+            if video_url:
+                return jsonify({'url': video_url})
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        print(f"yt-dlp extraction failed: {e}")
+
+    # Method 2: Fallback to public Invidious API instances if Vercel IP is heavily throttled
+    invidious_instances = [
+        "https://inv.tux.pizza",
+        "https://invidious.privacydev.net",
+        "https://vid.puffyan.us"
+    ]
+    
+    for instance in invidious_instances:
+        try:
+            res = requests.get(f"{instance}/api/v1/videos/{video_id}", timeout=4)
+            if res.status_code == 200:
+                data = res.json()
+                format_streams = data.get('formatStreams', [])
+                if format_streams:
+                    # Select stream with video and audio
+                    best_stream = format_streams[-1].get('url')
+                    if best_stream:
+                        return jsonify({'url': best_stream})
+        except Exception:
+            continue
+
+    return jsonify({'error': 'Failed to resolve stream link across all extractors'}), 500
