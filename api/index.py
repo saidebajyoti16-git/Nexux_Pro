@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request, render_template_string, Response, stream_with_context
+from flask import Flask, jsonify, request, render_template_string, Response
 from flask_cors import CORS
 import yt_dlp
 import requests
@@ -336,9 +336,25 @@ HTML_PAGE = """
 
             if(isMiniplayerActive) maximizeFromMiniplayer();
 
-            const videoNode = document.getElementById('mainVideo');
-            videoNode.src = `/api/stream-video?q=${encodeURIComponent(id)}`;
-            
+            showLoader("Resolving media URL...");
+
+            fetch(`/api/stream-video?q=${encodeURIComponent(id)}`)
+                .then(res => res.json())
+                .then(data => {
+                    hideLoader();
+                    if(data.error || !data.url) {
+                        alert("Failed to extract media URL.");
+                        return;
+                    }
+                    const videoNode = document.getElementById('mainVideo');
+                    videoNode.src = data.url;
+                    videoNode.play().catch(e => console.log("Autoplay blocked:", e));
+                })
+                .catch(() => {
+                    hideLoader();
+                    alert("Error fetching stream context.");
+                });
+
             if(v) {
                 document.getElementById('videoTitle').innerText = v.title;
                 document.getElementById('videoUploader').innerText = `Channel: ${v.uploader}`;
@@ -579,32 +595,20 @@ def proxy_thumbnail():
 @app.route('/api/stream-video', methods=['GET'])
 def stream_video():
     query = request.args.get('q')
-    if not query: return "Missing query", 400
+    if not query: return jsonify({'error': 'Missing query'}), 400
     
     target_url = get_clean_youtube_url(query)
     ydl_opts = {
-        'format': 'best[ext=mp4][height<=720]/best',
+        'format': 'best[ext=mp4][height<=720]/best[ext=mp4]/best',
         'quiet': True,
         'noplaylist': True,
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     }
     
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(target_url, download=False)
             video_url = info.get('url')
-
-            headers = {'User-Agent': ydl_opts['user_agent']}
-            range_header = request.headers.get('Range', None)
-            if range_header: headers['Range'] = range_header
-
-            req = requests.get(video_url, headers=headers, stream=True)
-            resp_headers = {k: v for k, v in req.headers.items() if k.lower() in ['content-type', 'content-length', 'content-range', 'accept-ranges']}
-
-            def generate():
-                for chunk in req.iter_content(chunk_size=1024 * 256):
-                    if chunk: yield chunk
-
-            return Response(stream_with_context(generate()), status=req.status_code, headers=resp_headers)
+            return jsonify({'url': video_url})
     except Exception as e:
-        return str(e), 500
+        return jsonify({'error': str(e)}), 500
