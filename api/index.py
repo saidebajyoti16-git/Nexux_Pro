@@ -4,6 +4,7 @@ import yt_dlp
 import requests
 import re
 import json
+import time
 
 app = Flask(__name__)
 CORS(app)
@@ -40,7 +41,6 @@ HTML_PAGE = """
             overflow: hidden;
         }
 
-        /* --- HEADER NAVIGATION BAR --- */
         .header {
             background: var(--bg-color);
             padding: 0 16px;
@@ -64,7 +64,6 @@ HTML_PAGE = """
         }
         .logo-badge { background: var(--nexus-blue); color: white; padding: 2px 6px; border-radius: 4px; font-size: 12px; }
         
-        /* Search Box */
         .search-container { position: relative; flex: 1; max-width: 600px; margin: 0 20px; }
         .input-group { display: flex; width: 100%; }
         input#queryInput { 
@@ -87,7 +86,6 @@ HTML_PAGE = """
         .suggestion-item { padding: 10px 16px; cursor: pointer; font-size: 14px; display: flex; align-items: center; gap: 10px; }
         .suggestion-item:hover { background: var(--hover-color); }
 
-        /* --- MAIN LAYOUT --- */
         .app-body { display: flex; flex: 1; overflow: hidden; position: relative; }
 
         .sidebar {
@@ -326,7 +324,8 @@ HTML_PAGE = """
             });
         }
 
-        function playVideo(id) {
+        // Retry loop for slow/throttled URL extraction
+        function playVideo(id, retryCount = 0) {
             const v = currentQueue.find(item => item.id === id);
             activeVideo = v;
 
@@ -336,23 +335,30 @@ HTML_PAGE = """
 
             if(isMiniplayerActive) maximizeFromMiniplayer();
 
-            showLoader("Resolving media URL...");
+            showLoader(retryCount > 0 ? `Bypassing rate limit (Attempt ${retryCount + 1})...` : "Resolving stream link...");
 
             fetch(`/api/stream-video?q=${encodeURIComponent(id)}`)
                 .then(res => res.json())
                 .then(data => {
-                    hideLoader();
-                    if(data.error || !data.url) {
-                        alert("Error: " + (data.error || "Failed to extract media URL."));
+                    if(data.error) {
+                        if(retryCount < 2) {
+                            // Delay 1.5 seconds and try again slow
+                            setTimeout(() => playVideo(id, retryCount + 1), 1500);
+                        } else {
+                            hideLoader();
+                            alert("YouTube rate-limited Vercel IP. Please try another video or refresh.");
+                        }
                         return;
                     }
+
+                    hideLoader();
                     const videoNode = document.getElementById('mainVideo');
                     videoNode.src = data.url;
                     videoNode.play().catch(e => console.log("Autoplay blocked:", e));
                 })
-                .catch(err => {
+                .catch(() => {
                     hideLoader();
-                    alert("Error fetching stream context.");
+                    alert("Network error.");
                 });
 
             if(v) {
@@ -563,7 +569,7 @@ def search_videos():
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            search_res = ydl.extract_info(f"ytsearch16:{query}", download=False)
+            search_res = ydl.extract_info(f"ytsearch12:{query}", download=False)
             results = []
             entries = json.loads(json.dumps(search_res.get('entries', [])))
 
@@ -604,15 +610,18 @@ def stream_video():
     target_url = get_clean_youtube_url(query)
     video_id = extract_video_id(query)
     
-    # Method 1: Try yt-dlp using Android & iOS client signatures to bypass YouTube datacenter blocks
+    # Introduce small delay to prevent Vercel burst throttling
+    time.sleep(0.5)
+
+    # Mobile API clients are less strict on Datacenter IPs
     ydl_opts = {
         'format': 'best',
         'quiet': True,
         'noplaylist': True,
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'user_agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15',
         'extractor_args': {
             'youtube': {
-                'player_client': ['android', 'ios', 'web']
+                'player_client': ['ios', 'android', 'mweb']
             }
         }
     }
@@ -624,9 +633,9 @@ def stream_video():
             if video_url:
                 return jsonify({'url': video_url})
     except Exception as e:
-        print(f"yt-dlp extraction failed: {e}")
+        print(f"yt-dlp error: {e}")
 
-    # Method 2: Fallback to public Invidious API instances if Vercel IP is heavily throttled
+    # Fallback to privacy instances when direct extraction is rate-limited
     invidious_instances = [
         "https://inv.tux.pizza",
         "https://invidious.privacydev.net",
@@ -635,16 +644,15 @@ def stream_video():
     
     for instance in invidious_instances:
         try:
-            res = requests.get(f"{instance}/api/v1/videos/{video_id}", timeout=4)
+            res = requests.get(f"{instance}/api/v1/videos/{video_id}", timeout=3)
             if res.status_code == 200:
                 data = res.json()
                 format_streams = data.get('formatStreams', [])
                 if format_streams:
-                    # Select stream with video and audio
                     best_stream = format_streams[-1].get('url')
                     if best_stream:
                         return jsonify({'url': best_stream})
         except Exception:
             continue
 
-    return jsonify({'error': 'Failed to resolve stream link across all extractors'}), 500
+    return jsonify({'error': 'Failed to resolve stream link across extractors'}), 500
