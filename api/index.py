@@ -40,6 +40,7 @@ HTML_PAGE = """
             overflow: hidden;
         }
 
+        /* --- HEADER NAVIGATION BAR --- */
         .header {
             background: var(--bg-color);
             padding: 0 16px;
@@ -63,6 +64,7 @@ HTML_PAGE = """
         }
         .logo-badge { background: var(--nexus-blue); color: white; padding: 2px 6px; border-radius: 4px; font-size: 12px; }
         
+        /* Search Box */
         .search-container { position: relative; flex: 1; max-width: 600px; margin: 0 20px; }
         .input-group { display: flex; width: 100%; }
         input#queryInput { 
@@ -85,6 +87,7 @@ HTML_PAGE = """
         .suggestion-item { padding: 10px 16px; cursor: pointer; font-size: 14px; display: flex; align-items: center; gap: 10px; }
         .suggestion-item:hover { background: var(--hover-color); }
 
+        /* --- MAIN LAYOUT --- */
         .app-body { display: flex; flex: 1; overflow: hidden; position: relative; }
 
         .sidebar {
@@ -343,6 +346,11 @@ HTML_PAGE = """
                 hideLoader();
             };
 
+            videoNode.onerror = () => {
+                hideLoader();
+                alert("Failed to load video stream. YouTube blocked proxy request.");
+            };
+
             videoNode.play().catch(e => console.log("Autoplay blocked:", e));
 
             if(v) {
@@ -591,12 +599,66 @@ def stream_video():
     query = request.args.get('q')
     if not query: return "Missing query", 400
     
-    target_url = get_clean_youtube_url(query)
+    video_id = extract_video_id(query)
+    target_url = f"https://www.youtube.com/watch?v={video_id}"
+
+    # Method 1: Bypass Bot Protection using Cobalt API
+    try:
+        cobalt_payload = {"url": target_url, "videoQuality": "720"}
+        cobalt_headers = {
+            "Accept": "application/json", 
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+        }
+        res = requests.post("https://api.cobalt.tools/", json=cobalt_payload, headers=cobalt_headers, timeout=6)
+        
+        if res.status_code == 200:
+            stream_url = res.json().get('url')
+            if stream_url:
+                req = requests.get(stream_url, stream=True, timeout=10)
+                resp_headers = {k: v for k, v in req.headers.items() if k.lower() in ['content-type', 'content-length', 'content-range', 'accept-ranges']}
+                
+                def generate():
+                    for chunk in req.iter_content(chunk_size=1024 * 256):
+                        if chunk: yield chunk
+                        
+                return Response(stream_with_context(generate()), status=req.status_code, headers=resp_headers)
+    except Exception as e:
+        print(f"Cobalt API failed: {e}")
+
+    # Method 2: Bypass using Invidious Privacy Instances
+    invidious_instances = [
+        "https://inv.tux.pizza",
+        "https://invidious.privacydev.net",
+        "https://vid.puffyan.us"
+    ]
+    
+    for instance in invidious_instances:
+        try:
+            res = requests.get(f"{instance}/api/v1/videos/{video_id}", timeout=4)
+            if res.status_code == 200:
+                format_streams = res.json().get('formatStreams', [])
+                if format_streams:
+                    stream_url = format_streams[-1].get('url')
+                    if stream_url:
+                        req = requests.get(stream_url, stream=True, timeout=10)
+                        resp_headers = {k: v for k, v in req.headers.items() if k.lower() in ['content-type', 'content-length', 'content-range', 'accept-ranges']}
+                        
+                        def generate():
+                            for chunk in req.iter_content(chunk_size=1024 * 256):
+                                if chunk: yield chunk
+                                
+                        return Response(stream_with_context(generate()), status=req.status_code, headers=resp_headers)
+        except Exception:
+            continue
+
+    # Method 3: Final yt-dlp attempt with iOS Client Spoofing
     ydl_opts = {
-        'format': 'best[ext=mp4][height<=720]/best[ext=mp4]/best',
+        'format': 'best[ext=mp4][height<=720]/best',
         'quiet': True,
         'noplaylist': True,
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        'user_agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15',
+        'extractor_args': {'youtube': {'player_client': ['ios', 'mweb']}}
     }
     
     try:
@@ -605,10 +667,7 @@ def stream_video():
             video_url = info.get('url')
 
             headers = {'User-Agent': ydl_opts['user_agent']}
-            range_header = request.headers.get('Range', None)
-            if range_header: headers['Range'] = range_header
-
-            req = requests.get(video_url, headers=headers, stream=True)
+            req = requests.get(video_url, headers=headers, stream=True, timeout=10)
             resp_headers = {k: v for k, v in req.headers.items() if k.lower() in ['content-type', 'content-length', 'content-range', 'accept-ranges']}
 
             def generate():
@@ -617,7 +676,7 @@ def stream_video():
 
             return Response(stream_with_context(generate()), status=req.status_code, headers=resp_headers)
     except Exception as e:
-        return str(e), 500
+        return f"Error: YouTube blocked all proxy attempts. {str(e)}", 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)
